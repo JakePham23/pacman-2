@@ -1,0 +1,54 @@
+# ======================
+# Python
+# ======================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# ======================
+# VS Code
+# ======================
+.vscode/
+.history/
+
+# ======================
+# macOS
+# ======================
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ======================
+# Logs & temp
+# ======================
+*.log
+*.tmp
+
+# ======================
+# Game / runtime output (nếu có)
+# ======================
+output/
+results/
+replays/
+
+# ======================
+# Student submissions (chỉ giữ agent.py cần nộp)
+# ======================
+submissions/*/*
+!submissions/*/agent.py
+
+# ======================
+# Python cache inside submissions
+# ======================
+submissions/**/__pycache__/
+
+# ======================
+# IDE
+# ======================
+.idea/
