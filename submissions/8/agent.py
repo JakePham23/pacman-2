@@ -22,6 +22,8 @@ IMPORTANT:
 
 import sys
 from pathlib import Path
+from collections import deque
+from heapq import heappush, heappop
 
 # Add src to path to import the interface
 src_path = Path(__file__).parent.parent.parent / "src"
@@ -57,7 +59,7 @@ class PacmanAgent(BasePacmanAgent):
              enemy_position: tuple,
              step_number: int):
         """
-        Decide the next move.
+        Decide the next move using A* algorithm.
         
         Args:
             map_state: 2D numpy array where 1=wall, 0=empty, -1=unseen (fog)
@@ -68,8 +70,6 @@ class PacmanAgent(BasePacmanAgent):
         Returns:
             Move or (Move, steps): Direction to move (optionally with step count)
         """
-        # TODO: Implement your search algorithm here
-        
         # Update memory if enemy is visible
         if enemy_position is not None:
             self.last_known_enemy_pos = enemy_position
@@ -84,32 +84,14 @@ class PacmanAgent(BasePacmanAgent):
                     return (move, 1)
             return (Move.STAY, 1)
         
-        # Example: Simple greedy approach (replace with your algorithm)
-        row_diff = target[0] - my_position[0]
-        col_diff = target[1] - my_position[1]
+        # Use A* to find optimal path to ghost
+        path = self.astar(my_position, target, map_state)
         
-        # Try to move towards ghost
-        if abs(row_diff) > abs(col_diff):
-            primary_move = Move.DOWN if row_diff > 0 else Move.UP
-            desired_steps = abs(row_diff)
-        else:
-            primary_move = Move.RIGHT if col_diff > 0 else Move.LEFT
-            desired_steps = abs(col_diff)
-
-        action = self._choose_action(
-            my_position,
-            [primary_move],
-            map_state,
-            desired_steps
-        )
-        if action:
-            return action
-
-        # If the primary direction is blocked, try other moves
-        fallback_moves = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]
-        action = self._choose_action(my_position, fallback_moves, map_state, self.pacman_speed)
-        if action:
-            return action
+        if path:
+            first_move = path[0]
+            # Calculate how many steps we can take in this direction
+            steps = self._max_valid_steps(my_position, first_move, map_state, self.pacman_speed)
+            return (first_move, max(1, steps))
         
         return (Move.STAY, 1)
     
@@ -148,6 +130,69 @@ class PacmanAgent(BasePacmanAgent):
             return False
         
         return map_state[row, col] == 0
+    
+    def _apply_move(self, pos: tuple, move: Move) -> tuple:
+        """Apply a move to a position, return new position."""
+        delta_row, delta_col = move.value
+        return (pos[0] + delta_row, pos[1] + delta_col)
+    
+    def _get_neighbors(self, pos: tuple, map_state: np.ndarray) -> list:
+        """Get all valid neighboring positions and their moves."""
+        neighbors = []
+        
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            next_pos = self._apply_move(pos, move)
+            if self._is_valid_position(next_pos, map_state):
+                neighbors.append((next_pos, move))
+        
+        return neighbors
+    
+    def _manhattan_distance(self, pos1: tuple, pos2: tuple) -> int:
+        """Calculate Manhattan distance between two positions."""
+        return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
+    
+    def astar(self, start: tuple, goal: tuple, map_state: np.ndarray) -> list:
+        """
+        Find optimal path from start to goal using A* search.
+        
+        Returns:
+            List of Move enums representing the path, or [] if no path
+        """
+        def heuristic(pos):
+            """Manhattan distance heuristic."""
+            return self._manhattan_distance(pos, goal)
+        
+        # Priority queue stores (f_cost, counter, position, path)
+        # counter is for tiebreaking
+        frontier = [(0, 0, start, [])]
+        visited = set()
+        counter = 0
+        
+        while frontier:
+            f_cost, _, current_pos, path = heappop(frontier)
+            
+            # Found the goal!
+            if current_pos == goal:
+                return path
+            
+            # Skip if already visited
+            if current_pos in visited:
+                continue
+            
+            visited.add(current_pos)
+            
+            # Explore neighbors
+            for next_pos, move in self._get_neighbors(current_pos, map_state):
+                if next_pos not in visited:
+                    new_path = path + [move]
+                    g_cost = len(new_path)  # Cost so far
+                    h_cost = heuristic(next_pos)  # Estimated cost to goal
+                    f_cost = g_cost + h_cost  # Total estimated cost
+                    counter += 1
+                    heappush(frontier, (f_cost, counter, next_pos, new_path))
+        
+        # No path found
+        return []
 
 
 class GhostAgent(BaseGhostAgent):
