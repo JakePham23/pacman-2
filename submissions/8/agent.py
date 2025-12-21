@@ -27,6 +27,7 @@ from heapq import heappush, heappop
 from model import PacmanNet
 from collections import deque
 import random
+import torch
 import math
 import time
 
@@ -39,7 +40,11 @@ from agent_interface import GhostAgent as BaseGhostAgent
 from environment import Move
 import numpy as np
 
-
+try:
+    from model import PacmanNet
+except ImportError:
+    # Fallback nếu không tìm thấy file model (để tránh crash lúc nộp nếu thiếu)
+    PacmanNet = None
 class PacmanAgent(BasePacmanAgent):
     """
     Pacman (Seeker) Agent - Goal: Catch the Ghost
@@ -61,98 +66,166 @@ class PacmanAgent(BasePacmanAgent):
         self.last_move = None
         self.internal_map = None # Will store 0 for empty, 1 for wall, -1 for unknown
         self.map_initialized = False
+        # --- LOAD MODEL ML ---
+        self.device = torch.device("cpu") # Nộp bài bắt buộc dùng CPU
+        self.model = None
+        if PacmanNet:
+            try:
+                self.model = PacmanNet()
+                # Tự động tìm file .pt trong cùng thư mục
+                current_dir = Path(__file__).parent
+                # Ưu tiên file smart ghost, nếu không có thì tìm file dqn thường
+                model_path = current_dir / "pacman_smart_ghost.pt"
+                if not model_path.exists():
+                    model_path = current_dir / "pacman_dqn.pt"
+                
+                if model_path.exists():
+                    # Load weights (map_location='cpu' để an toàn)
+                    self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+                    self.model.eval()
+                    # print(f"Model loaded: {model_path.name}")
+                else:
+                    print("Warning: No .pt file found! Pacman will use A* only.")
+                    self.model = None
+            except Exception as e:
+                print(f"Model load error: {e}")
+                self.model = None
 
     def _update_map_memory(self, map_state):
-        """Merge current observation into internal memory map"""
         if not self.map_initialized:
             self.internal_map = np.full_like(map_state, -1)
             self.map_initialized = True
+        visible_mask = map_state != -1
+        self.internal_map[visible_mask] = map_state[visible_mask]
         
         # Update visible cells: where map_state is not -1 (unseen)
         visible_mask = map_state != -1
         self.internal_map[visible_mask] = map_state[visible_mask]
-    def step(self, map_state: np.ndarray, 
-             my_position: tuple, 
-             enemy_position: tuple,
-             step_number: int):
-        
-        # 1. Update Memory
+    def get_ml_action(self, map_data, my_pos, enemy_pos):
+        """Chạy Model để lấy nước đi tốt nhất"""
+        try:
+            # 1. Preprocess Map (Giống lúc train)
+            # Map lúc train là 0=Empty, 1=Wall, 2=Pacman, 3=Ghost. Không có -1.
+            # Nên ta thay -1 (unseen) thành 0 (coi như đi được) hoặc 1 (tường) để model không bị loạn.
+            # An toàn nhất: Coi unseen là tường để tránh đâm bậy, hoặc empty để dũng cảm.
+            # Chọn: Replace -1 -> 0 (Optimistic)
+            input_map = map_data.copy()
+            input_map[input_map == -1] = 0 
+            
+            # Đánh dấu vị trí
+            if my_pos: input_map[my_pos] = 2
+            if enemy_pos: input_map[enemy_pos] = 3
+            
+            # 2. Tensor conversion
+            state_tensor = torch.FloatTensor(input_map).unsqueeze(0).unsqueeze(0).to(self.device)
+            
+            # 3. Last move vector
+            move_idx = -1
+            all_moves = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]
+            if self.last_move in all_moves:
+                move_idx = all_moves.index(self.last_move)
+            
+            last_move_vec = torch.zeros(1, 4).to(self.device)
+            if move_idx >= 0:
+                last_move_vec[0, move_idx] = 1.0
+                
+            # 4. Predict
+            with torch.no_grad():
+                q_values = self.model(state_tensor, last_move_vec)
+                action_idx = torch.argmax(q_values).item()
+                
+            predicted_move = all_moves[action_idx]
+            
+            reverse_map = {Move.UP: Move.DOWN, Move.DOWN: Move.UP, 
+                           Move.LEFT: Move.RIGHT, Move.RIGHT: Move.LEFT}
+            
+            # Nếu nước đi mới là quay ngược lại hướng cũ -> Bỏ qua, để cho A* xử lý
+            if predicted_move == reverse_map.get(self.last_move, None):
+                return Move.STAY # Trả về STAY để kích hoạt fallback A* (A* khôn hơn trong việc gỡ rối)
+            # --------------------------------------------------
+
+            # 5. Safety Check
+            if self._can_move_steps(my_pos, predicted_move, map_data, 1):
+                return predicted_move
+            else:
+                return Move.STAY
+                
+        except Exception:
+            return Move.STAY
+    def step(self, map_state: np.ndarray, my_position: tuple, enemy_position: tuple, step_number: int):
+        self.step_count = step_number
         self._update_map_memory(map_state)
         
-        # 2. Track Enemy
-        if enemy_position is not None:
+        if enemy_position:
             self.last_known_enemy_pos = enemy_position
         
         target = enemy_position or self.last_known_enemy_pos
         
-        # 3. Decision Making
-        if target:
-            # Hunter Mode: Path to enemy
-            path = self.astar(my_position, target, self.internal_map)
-        else:
-            # Explore Mode: Tìm ô -1 (sương mù) gần nhất
-            unknowns = np.argwhere(self.internal_map == -1)
-            if len(unknowns) > 0:
-                # Tìm ô -1 có khoảng cách Manhattan nhỏ nhất
-                distances = np.sum(np.abs(unknowns - np.array(my_position)), axis=1)
-                nearest_unknown = tuple(unknowns[np.argmin(distances)])
-                path = self.astar(my_position, nearest_unknown, self.internal_map)
-            else:
-                # Nếu đã khám phá hết map mà ko thấy địch -> đi random hoặc tuần tra
-                # Tạm thời đi về giữa map hoặc đi random valid move
-                path = self.astar(my_position, (10, 10), self.internal_map)
-
         chosen_move = Move.STAY
-        
-        if path:
-            chosen_move = path[0]
-        else:
-            # Fallback if A* fails (blocked or at target)
-            valid_moves = [m for m in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT] 
-                           if self._is_valid_move(my_position, m, self.internal_map)]
-            if valid_moves:
-                # Prefer keeping same direction if valid
-                if self.last_move in valid_moves:
-                    chosen_move = self.last_move
-                else:
-                    chosen_move = valid_moves[0]
+        use_ml = False
 
-        # [cite_start]4. Momentum Logic (Quan trọng: Xử lý bước đi 2 ô) [cite: 37, 39, 41]
-        steps = 1
-        
-        # Chỉ kích hoạt đi 2 bước nếu thỏa mãn ĐỦ 3 điều kiện:
-        # 1. Bot muốn đi (không đứng im)
-        # 2. Hướng đi mới TRÙNG với hướng cũ (đang lấy đà)
-        # 3. QUAN TRỌNG: Arena cho phép đi >= 2 bước (self.pacman_speed >= 2)
-        if (chosen_move != Move.STAY and 
-            chosen_move == self.last_move and 
-            self.pacman_speed >= 2):
+        # --- CHIẾN THUẬT QUYẾT ĐỊNH ---
+        # 1. Nếu thấy địch (hoặc biết vị trí gần đây) -> Dùng ML để săn (Aggressive)
+        if target and self.model is not None:
+            # Chỉ dùng ML nếu địch đang hiển thị trên bản đồ (để input chính xác)
+            # Hoặc nếu ta giả lập vị trí địch vào bản đồ memory
+            chosen_move = self.get_ml_action(self.internal_map, my_position, target)
+            use_ml = True
             
-            # Kiểm tra xem bước thứ 2 có bị đâm đầu vào tường không
-            if self._can_move_steps(my_position, chosen_move, self.internal_map, 2):
-                steps = 2
+        # 2. Nếu không thấy địch hoặc ML fail -> Dùng A* để đi tuần tra/khám phá
+        if not use_ml or chosen_move == Move.STAY:
+            path = []
+            if target:
+                path = self.astar(my_position, target, self.internal_map)
+            else:
+                # Explore Mode: Tìm sương mù gần nhất
+                unknowns = np.argwhere(self.internal_map == -1)
+                if len(unknowns) > 0:
+                    dists = np.sum(np.abs(unknowns - np.array(my_position)), axis=1)
+                    nearest_unknown = tuple(unknowns[np.argmin(dists)])
+                    path = self.astar(my_position, nearest_unknown, self.internal_map)
+                else:
+                    # Map sáng hết mà ko thấy địch -> đi về giữa hoặc random
+                    path = self.astar(my_position, (10, 10), self.internal_map)
+            
+            if path:
+                chosen_move = path[0]
+            else:
+                # Fallback Random
+                valid_moves = [m for m in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT] 
+                               if self._can_move_steps(my_position, m, self.internal_map, 1)]
+                if valid_moves:
+                     # Ưu tiên đi thẳng
+                    if self.last_move in valid_moves:
+                        chosen_move = self.last_move
+                    else:
+                        chosen_move = valid_moves[0]
+
+        # --- MOMENTUM LOGIC (SPEED 2) ---
+        steps = 1
+        if chosen_move != Move.STAY:
+            if (chosen_move == self.last_move and self.pacman_speed >= 2):
+                if self._can_move_steps(my_position, chosen_move, self.internal_map, 2):
+                    steps = 2
+                else:
+                    steps = 1
             else:
                 steps = 1
-        else:
-            steps = 1 # Trường hợp rẽ, hoặc Arena chỉ cho speed=1
         
         self.last_move = chosen_move
         return (chosen_move, steps)
     
     # Helper methods (you can add more)
     def _can_move_steps(self, pos, move, map_data, steps_to_check):
-        """Check if we can move N steps in a direction without hitting wall"""
         r, c = pos
         dr, dc = move.value
         for i in range(1, steps_to_check + 1):
             nr, nc = r + dr * i, c + dc * i
-            # Check bounds and walls
             if not (0 <= nr < map_data.shape[0] and 0 <= nc < map_data.shape[1]):
                 return False
-            if map_data[nr, nc] == 1: # Wall
+            if map_data[nr, nc] == 1: 
                 return False
         return True
-
     def _is_valid_move(self, pos, move, map_data):
         return self._can_move_steps(pos, move, map_data, 1)
     def _manhattan_distance(self, pos1, pos2):
@@ -194,62 +267,40 @@ class PacmanAgent(BasePacmanAgent):
         delta_row, delta_col = move.value
         return (pos[0] + delta_row, pos[1] + delta_col)
     
-    def _get_neighbors(self, pos: tuple, map_state: np.ndarray) -> list:
-        """Get all valid neighboring positions and their moves."""
+    def _get_neighbors(self, pos, map_state):
         neighbors = []
-        
         for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            next_pos = self._apply_move(pos, move)
-            if self._is_valid_position(next_pos, map_state):
+            dr, dc = move.value
+            next_pos = (pos[0] + dr, pos[1] + dc)
+            # A* đi được vào ô 0 và -1
+            if (0 <= next_pos[0] < map_state.shape[0] and 
+                0 <= next_pos[1] < map_state.shape[1] and 
+                map_state[next_pos] != 1):
                 neighbors.append((next_pos, move))
-        
         return neighbors
     
     def _manhattan_distance(self, pos1: tuple, pos2: tuple) -> int:
         """Calculate Manhattan distance between two positions."""
         return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
     
-    def astar(self, start: tuple, goal: tuple, map_state: np.ndarray) -> list:
-        """
-        Find optimal path from start to goal using A* search.
-        
-        Returns:
-            List of Move enums representing the path, or [] if no path
-        """
-        def heuristic(pos):
-            """Manhattan distance heuristic."""
-            return self._manhattan_distance(pos, goal)
-        
-        # Priority queue stores (f_cost, counter, position, path)
-        # counter is for tiebreaking
+    def astar(self, start, goal, map_state):
+        if start == goal: return []
         frontier = [(0, 0, start, [])]
         visited = set()
         counter = 0
-        
         while frontier:
-            f_cost, _, current_pos, path = heappop(frontier)
-            
-            # Found the goal!
-            if current_pos == goal:
-                return path
-            
-            # Skip if already visited
-            if current_pos in visited:
-                continue
-            
-            visited.add(current_pos)
-            
-            # Explore neighbors
-            for next_pos, move in self._get_neighbors(current_pos, map_state):
+            _, _, current, path = heappop(frontier)
+            if current == goal: return path
+            if current in visited: continue
+            visited.add(current)
+            for next_pos, move in self._get_neighbors(current, map_state):
                 if next_pos not in visited:
                     new_path = path + [move]
-                    g_cost = len(new_path)  # Cost so far
-                    h_cost = heuristic(next_pos)  # Estimated cost to goal
-                    f_cost = g_cost + h_cost  # Total estimated cost
+                    g = len(new_path)
+                    h = self._manhattan_distance(next_pos, goal)
+                    f = g + h
                     counter += 1
-                    heappush(frontier, (f_cost, counter, next_pos, new_path))
-        
-        # No path found
+                    heappush(frontier, (f, counter, next_pos, new_path))
         return []
 
 

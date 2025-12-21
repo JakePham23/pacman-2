@@ -52,3 +52,7 @@ submissions/**/__pycache__/
 # IDE
 # ======================
 .idea/
+
+
+submissions/8/train.py
+submissions/8/train2.py
