@@ -6,3 +6,4 @@ ortools
 cpmpy
 pycsp3
 minizinc
+torch

@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 from collections import deque
 from heapq import heappush, heappop
-
+from model import PacmanNet
 # Add src to path to import the interface
 src_path = Path(__file__).parent.parent.parent / "src"
 sys.path.insert(0, str(src_path))
@@ -53,50 +53,105 @@ class PacmanAgent(BasePacmanAgent):
         self.name = "Template Pacman"
         # Memory for limited observation mode
         self.last_known_enemy_pos = None
-    
+        self.last_move = None
+        self.internal_map = None # Will store 0 for empty, 1 for wall, -1 for unknown
+        self.map_initialized = False
+
+    def _update_map_memory(self, map_state):
+        """Merge current observation into internal memory map"""
+        if not self.map_initialized:
+            self.internal_map = np.full_like(map_state, -1)
+            self.map_initialized = True
+        
+        # Update visible cells: where map_state is not -1 (unseen)
+        visible_mask = map_state != -1
+        self.internal_map[visible_mask] = map_state[visible_mask]
     def step(self, map_state: np.ndarray, 
              my_position: tuple, 
              enemy_position: tuple,
              step_number: int):
-        """
-        Decide the next move using A* algorithm.
         
-        Args:
-            map_state: 2D numpy array where 1=wall, 0=empty, -1=unseen (fog)
-            my_position: Your current (row, col) in absolute coordinates
-            enemy_position: Ghost's (row, col) if visible, None otherwise
-            step_number: Current step number (starts at 1)
-            
-        Returns:
-            Move or (Move, steps): Direction to move (optionally with step count)
-        """
-        # Update memory if enemy is visible
+        # 1. Update Memory
+        self._update_map_memory(map_state)
+        
+        # 2. Track Enemy
         if enemy_position is not None:
             self.last_known_enemy_pos = enemy_position
         
-        # Use current sighting, fallback to last known, or explore
         target = enemy_position or self.last_known_enemy_pos
         
-        if target is None:
-            # No information about enemy - explore randomly
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                if self._is_valid_move(my_position, move, map_state):
-                    return (move, 1)
-            return (Move.STAY, 1)
-        
-        # Use A* to find optimal path to ghost
-        path = self.astar(my_position, target, map_state)
+        # 3. Decision Making
+        if target:
+            # Hunter Mode: Path to enemy
+            path = self.astar(my_position, target, self.internal_map)
+        else:
+            # Explore Mode: Tìm ô -1 (sương mù) gần nhất
+            unknowns = np.argwhere(self.internal_map == -1)
+            if len(unknowns) > 0:
+                # Tìm ô -1 có khoảng cách Manhattan nhỏ nhất
+                distances = np.sum(np.abs(unknowns - np.array(my_position)), axis=1)
+                nearest_unknown = tuple(unknowns[np.argmin(distances)])
+                path = self.astar(my_position, nearest_unknown, self.internal_map)
+            else:
+                # Nếu đã khám phá hết map mà ko thấy địch -> đi random hoặc tuần tra
+                # Tạm thời đi về giữa map hoặc đi random valid move
+                path = self.astar(my_position, (10, 10), self.internal_map)
+
+        chosen_move = Move.STAY
         
         if path:
-            first_move = path[0]
-            # Calculate how many steps we can take in this direction
-            steps = self._max_valid_steps(my_position, first_move, map_state, self.pacman_speed)
-            return (first_move, max(1, steps))
+            chosen_move = path[0]
+        else:
+            # Fallback if A* fails (blocked or at target)
+            valid_moves = [m for m in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT] 
+                           if self._is_valid_move(my_position, m, self.internal_map)]
+            if valid_moves:
+                # Prefer keeping same direction if valid
+                if self.last_move in valid_moves:
+                    chosen_move = self.last_move
+                else:
+                    chosen_move = valid_moves[0]
+
+        # [cite_start]4. Momentum Logic (Quan trọng: Xử lý bước đi 2 ô) [cite: 37, 39, 41]
+        steps = 1
         
-        return (Move.STAY, 1)
+        # Chỉ kích hoạt đi 2 bước nếu thỏa mãn ĐỦ 3 điều kiện:
+        # 1. Bot muốn đi (không đứng im)
+        # 2. Hướng đi mới TRÙNG với hướng cũ (đang lấy đà)
+        # 3. QUAN TRỌNG: Arena cho phép đi >= 2 bước (self.pacman_speed >= 2)
+        if (chosen_move != Move.STAY and 
+            chosen_move == self.last_move and 
+            self.pacman_speed >= 2):
+            
+            # Kiểm tra xem bước thứ 2 có bị đâm đầu vào tường không
+            if self._can_move_steps(my_position, chosen_move, self.internal_map, 2):
+                steps = 2
+            else:
+                steps = 1
+        else:
+            steps = 1 # Trường hợp rẽ, hoặc Arena chỉ cho speed=1
+        
+        self.last_move = chosen_move
+        return (chosen_move, steps)
     
     # Helper methods (you can add more)
-    
+    def _can_move_steps(self, pos, move, map_data, steps_to_check):
+        """Check if we can move N steps in a direction without hitting wall"""
+        r, c = pos
+        dr, dc = move.value
+        for i in range(1, steps_to_check + 1):
+            nr, nc = r + dr * i, c + dc * i
+            # Check bounds and walls
+            if not (0 <= nr < map_data.shape[0] and 0 <= nc < map_data.shape[1]):
+                return False
+            if map_data[nr, nc] == 1: # Wall
+                return False
+        return True
+
+    def _is_valid_move(self, pos, move, map_data):
+        return self._can_move_steps(pos, move, map_data, 1)
+    def _manhattan_distance(self, pos1, pos2):
+        return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
     def _choose_action(self, pos: tuple, moves, map_state: np.ndarray, desired_steps: int):
         for move in moves:
             max_steps = min(self.pacman_speed, max(1, desired_steps))
@@ -122,14 +177,12 @@ class PacmanAgent(BasePacmanAgent):
         return self._max_valid_steps(pos, move, map_state, 1) == 1
     
     def _is_valid_position(self, pos: tuple, map_state: np.ndarray) -> bool:
-        """Check if a position is valid (not a wall and within bounds)."""
         row, col = pos
         height, width = map_state.shape
-        
         if row < 0 or row >= height or col < 0 or col >= width:
             return False
-        
-        return map_state[row, col] == 0
+        # SỬA: Đi được nếu không phải là tường (1). Nghĩa là 0 và -1 đều đi được.
+        return map_state[row, col] != 1
     
     def _apply_move(self, pos: tuple, move: Move) -> tuple:
         """Apply a move to a position, return new position."""
