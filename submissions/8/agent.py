@@ -321,9 +321,10 @@ class PacmanAgent(BasePacmanAgent):
 
 class GhostAgent(BaseGhostAgent):
     """
-    Ghost Ninja Pro (Updated):
-    - Hỗ trợ tính toán Pacman Speed 2 chính xác.
-    - Dùng Iterative Deepening để kiểm soát thời gian.
+    Ghost Ninja Pro Max (Hardcore):
+    - Hỗ trợ --capture-distance 1 (Bị bắt khi đứng cạnh).
+    - Hỗ trợ --pacman-speed 2.
+    - Alpha-Beta Pruning & Dead-end Avoidance.
     """
     
     def __init__(self, **kwargs):
@@ -331,13 +332,16 @@ class GhostAgent(BaseGhostAgent):
         self.last_known_enemy_pos = None
         self.steps_since_seen = 0
         self.survival_target = None
+        
+        # --- CẤU HÌNH QUAN TRỌNG TỪ ARENA ---
+        self.capture_dist = 1  # Khoảng cách bị bắt (sửa thành 0 nếu luật đổi)
+        self.time_limit = 0.85 # Giới hạn thời gian an toàn
         self.time_start = 0 
-        self.time_limit = 0.9 
 
     def step(self, map_state: np.ndarray, my_position: tuple, enemy_position: tuple, step_number: int) -> Move:
         self.time_start = time.time()
         
-        # 1. Cập nhật thông tin
+        # 1. Cập nhật thông tin kẻ địch
         if enemy_position:
             self.last_known_enemy_pos = enemy_position
             self.steps_since_seen = 0
@@ -347,18 +351,19 @@ class GhostAgent(BaseGhostAgent):
 
         target_enemy = enemy_position or self.last_known_enemy_pos
 
-        # --- CHIẾN THUẬT A: ĐI TUẦN ---
-        if target_enemy is None or self.steps_since_seen > 5:
+        # --- CHIẾN THUẬT A: ĐI TUẦN (Mất dấu > 7 bước hoặc chưa từng thấy) ---
+        if target_enemy is None or self.steps_since_seen > 7:
             if not self.survival_target or my_position == self.survival_target:
                  self.survival_target = self.find_nearest_intersection(my_position, map_state)
+            
             path = self.bfs_find_path(my_position, self.survival_target, map_state)
             if path: return path[0]
             return self.get_random_valid_move(my_position, map_state)
 
-        # --- CHIẾN THUẬT B: ITERATIVE DEEPENING MINIMAX ---
+        # --- CHIẾN THUẬT B: ALPHA-BETA MINIMAX ---
         else:
             best_move = Move.STAY
-            # Pacman Speed 2 tính toán rất nặng, nên depth có thể chỉ lên được 4-6
+            # Iterative Deepening: Tăng dần độ sâu tìm kiếm
             for depth in range(1, 20): 
                 try:
                     if time.time() - self.time_start > self.time_limit: break
@@ -367,6 +372,8 @@ class GhostAgent(BaseGhostAgent):
                         my_pos=my_position, 
                         enemy_pos=target_enemy, 
                         depth=depth, 
+                        alpha=-math.inf,
+                        beta=math.inf,
                         is_maximizing=True, 
                         map_state=map_state
                     )
@@ -381,104 +388,131 @@ class GhostAgent(BaseGhostAgent):
             return best_move
 
     # =========================================================================
-    # MINIMAX VỚI MÔ PHỎNG PACMAN SPEED 2
+    # MINIMAX (SỬA ĐỔI CHO CAPTURE DISTANCE 1)
     # =========================================================================
 
-    def minimax(self, my_pos, enemy_pos, depth, is_maximizing, map_state):
+    def minimax(self, my_pos, enemy_pos, depth, alpha, beta, is_maximizing, map_state):
         if time.time() - self.time_start > self.time_limit: raise TimeoutError()
 
-        # 1. Điều kiện dừng
-        if depth == 0 or my_pos == enemy_pos:
+        # 1. Kiểm tra điều kiện thua ngay lập tức (Capture Distance Logic)
+        curr_dist = abs(my_pos[0] - enemy_pos[0]) + abs(my_pos[1] - enemy_pos[1])
+        if curr_dist <= self.capture_dist:
+            return -100000, None # Bị bắt (kể cả đứng cạnh cũng chết)
+
+        # 2. Hết độ sâu tìm kiếm
+        if depth == 0:
             return self.evaluate_ninja_state(my_pos, enemy_pos, map_state), Move.STAY
 
-        valid_moves = self.get_valid_moves_with_pos(my_pos, map_state)
-        if not valid_moves: return -1000, Move.STAY
+        # 3. Lượt GHOST (Maximizing)
+        if is_maximizing:
+            valid_moves = self.get_valid_moves_with_pos(my_pos, map_state)
+            # Heuristic sort: Ưu tiên ô xa địch
+            valid_moves.sort(key=lambda x: abs(x[0][0]-enemy_pos[0]) + abs(x[0][1]-enemy_pos[1]), reverse=True)
 
-        best_move = valid_moves[0][1]
+            if not valid_moves: return -100000, Move.STAY # Kẹt -> Chết
 
-        if is_maximizing: # Lượt GHOST
             max_eval = -math.inf
+            best_move = valid_moves[0][1]
+
             for next_pos, move in valid_moves:
-                # Pacman cũng sẽ di chuyển dựa trên vị trí mới của Ghost
-                eval_score, _ = self.minimax(next_pos, enemy_pos, depth - 1, False, map_state)
+                # Nếu đi vào ô mà khoảng cách tới địch <= capture_dist -> Tự sát -> Bỏ qua hoặc điểm thấp
+                if abs(next_pos[0] - enemy_pos[0]) + abs(next_pos[1] - enemy_pos[1]) <= self.capture_dist:
+                     eval_score = -90000 # Điểm phạt tự sát
+                else:
+                    eval_score, _ = self.minimax(next_pos, enemy_pos, depth - 1, alpha, beta, False, map_state)
+                
                 if eval_score > max_eval:
                     max_eval = eval_score
                     best_move = move
+                
+                alpha = max(alpha, eval_score)
+                if beta <= alpha: break 
+
             return max_eval, best_move
 
-        else: # Lượt PACMAN (Mô phỏng 2 bước)
+        # 4. Lượt PACMAN (Minimizing - Speed 2)
+        else:
             min_eval = math.inf
             
-            # --- QUAN TRỌNG: Lấy tất cả các ô Pacman tới được trong 2 bước ---
+            # Pacman đi 2 bước
             pacman_reachable = self.get_pacman_reachable_positions(enemy_pos, 2, map_state)
             
-            # Nếu Pacman có thể bắt được Ghost trong lượt này -> Game Over ngay
-            if my_pos in pacman_reachable:
-                return -10000, None
+            # Kiểm tra xem Pacman có thể nhảy tới vùng nguy hiểm không
+            # Vùng nguy hiểm: Bất kỳ ô nào cách Ghost <= capture_dist
+            for p_pos in pacman_reachable:
+                dist_check = abs(my_pos[0] - p_pos[0]) + abs(my_pos[1] - p_pos[1])
+                if dist_check <= self.capture_dist:
+                    return -100000, None # Pacman bắt được Ghost
 
             for next_enemy_pos in pacman_reachable:
-                # Ghost đi tiếp dựa trên vị trí mới của Pacman
-                eval_score, _ = self.minimax(my_pos, next_enemy_pos, depth - 1, True, map_state)
+                eval_score, _ = self.minimax(my_pos, next_enemy_pos, depth - 1, alpha, beta, True, map_state)
+                
                 if eval_score < min_eval:
                     min_eval = eval_score
+                
+                beta = min(beta, eval_score)
+                if beta <= alpha: break 
+
             return min_eval, None
 
     # =========================================================================
-    # HÀM MỚI: TÌM CÁC Ô PACMAN TỚI ĐƯỢC (SPEED N)
+    # HÀM ĐÁNH GIÁ (UPDATED FOR CAPTURE DIST 1)
     # =========================================================================
-    
+
+    def evaluate_ninja_state(self, my_pos, enemy_pos, map_state):
+        dist = abs(my_pos[0] - enemy_pos[0]) + abs(my_pos[1] - enemy_pos[1])
+        
+        # Nếu khoảng cách <= 1, coi như đã chết (đã check ở trên nhưng thêm cho chắc)
+        if dist <= self.capture_dist: return -100000
+        
+        # Nếu khoảng cách <= 3 (Pacman đi 2 bước + 1 bước bắt), cực kỳ nguy hiểm
+        # Pacman Speed 2 có tầm với thực tế là: 2 bước di chuyển + 1 bước bắt = 3 ô
+        if dist <= self.capture_dist + 2: 
+            return -5000 + (dist * 100) # Vẫn ưu tiên xa hơn một chút trong vùng tử thần
+
+        score = dist * 10 
+
+        # Line of Sight
+        is_visible = self.check_line_of_sight(my_pos, enemy_pos, map_state)
+        if not is_visible:
+            score += 600 # Tăng thưởng ẩn nấp vì game khó hơn
+            if my_pos[0] != enemy_pos[0] and my_pos[1] != enemy_pos[1]: 
+                score += 100
+        else:
+            score -= 300
+
+        # Dead-end Check
+        if self.is_dead_end(my_pos, map_state):
+            score -= 3000 # Phạt nặng hơn
+        
+        return score
+
+    # =========================================================================
+    # CÁC HÀM BỔ TRỢ (GIỮ NGUYÊN)
+    # =========================================================================
+
+    def is_dead_end(self, pos, map_state):
+        moves = self.get_valid_moves_with_pos(pos, map_state)
+        return len(moves) <= 1
+
     def get_pacman_reachable_positions(self, start_pos, speed, map_state):
-        """
-        Trả về tập hợp tất cả các vị trí mà Pacman có thể đứng sau 'speed' bước đi.
-        Dùng BFS giới hạn độ sâu.
-        """
         reachable = set()
-        queue = deque([(start_pos, 0)]) # (vị trí, số bước đã đi)
-        
-        # Để tối ưu, ta có thể dùng set visited cho từng tầng, nhưng ở đây
-        # với speed=2 thì số lượng ô không nhiều (tối đa 13 ô), nên ta duyệt hết.
-        
+        queue = deque([(start_pos, 0)]) 
         while queue:
             curr, steps = queue.popleft()
-            
-            # Nếu đã đi hết số bước cho phép -> Thêm vào danh sách đích
             if steps == speed:
                 reachable.add(curr)
                 continue
             
-            # Nếu chưa hết bước, vẫn thêm vào danh sách (vì Pacman có thể dừng lại hoặc đi chưa hết tốc lực)
-            # Tuy nhiên, giả định Pacman luôn đi max tốc độ để bắt mình thì:
-            # reachable.add(curr) <--- Có thể bỏ dòng này nếu Pacman buộc phải đi đủ 2 bước
+            # Giả định Pacman thông minh, hắn sẽ không đứng lại nếu chưa bắt được
+            # Trừ khi việc đứng lại giúp hắn bắt được (đã check ở logic dist <= 1)
+            # reachable.add(curr) 
             
-            # Tìm các ô tiếp theo
             moves = self.get_valid_moves_with_pos(curr, map_state)
-            
-            # Nếu bị kẹt (không đi được nữa) dù chưa hết speed -> Coi như dừng tại đây
-            if not moves:
-                reachable.add(curr)
-            
+            if not moves: reachable.add(curr)
             for next_pos, _ in moves:
-                # Lưu ý: Không dùng visited toàn cục để cho phép Pacman đi qua đi lại (nếu cần thiết)
-                # Nhưng để tránh vòng lặp vô tận thì speed giới hạn đã lo rồi.
                 queue.append((next_pos, steps + 1))
-                
-        # Lọc lại: Với Minimax, ta chỉ quan tâm các vị trí CUỐI CÙNG mà Pacman có thể đứng.
-        return reachable
-
-    # --- CÁC HÀM CŨ GIỮ NGUYÊN ---
-    def evaluate_ninja_state(self, my_pos, enemy_pos, map_state):
-        dist = abs(my_pos[0] - enemy_pos[0]) + abs(my_pos[1] - enemy_pos[1])
-        if dist == 0: return -10000
-        score = dist * 10 
-        is_visible = self.check_line_of_sight(my_pos, enemy_pos, map_state)
-        if not is_visible:
-            score += 500
-            if my_pos[0] != enemy_pos[0] and my_pos[1] != enemy_pos[1]: score += 50
-        else:
-            score -= 200
-        escapes = len(self.get_valid_moves_with_pos(my_pos, map_state))
-        if escapes <= 1: score -= 300
-        return score
+        return list(reachable)
 
     def check_line_of_sight(self, pos1, pos2, map_state):
         r1, c1 = pos1
@@ -526,14 +560,13 @@ class GhostAgent(BaseGhostAgent):
         for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
             dr, dc = move.value
             nr, nc = pos[0] + dr, pos[1] + dc
-            if 0 <= nr < map_state.shape[0] and 0 <= nc < map_state.shape[1] and map_state[nr, nc] != 1:
-                valid.append(((nr, nc), move))
+            if 0 <= nr < map_state.shape[0] and 0 <= nc < map_state.shape[1]:
+                if map_state[nr, nc] != 1:
+                    valid.append(((nr, nc), move))
         return valid
 
     def get_random_valid_move(self, pos, map_state):
         moves = self.get_valid_moves_with_pos(pos, map_state)
         if moves: return random.choice(moves)[1]
         return Move.STAY
-
-
         
