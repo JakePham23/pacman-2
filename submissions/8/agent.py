@@ -24,26 +24,41 @@ import sys
 from pathlib import Path
 from collections import deque
 from heapq import heappush, heappop
-from model import PacmanNet
-from collections import deque
 import random
 import torch
 import math
 import time
+import numpy as np
 
 # Add src to path to import the interface
 src_path = Path(__file__).parent.parent.parent / "src"
-sys.path.insert(0, str(src_path))
-
-from agent_interface import PacmanAgent as BasePacmanAgent
-from agent_interface import GhostAgent as BaseGhostAgent
-from environment import Move
-import numpy as np
+if str(src_path) not in sys.path:
+    sys.path.insert(0, str(src_path))
 
 try:
+    from agent_interface import PacmanAgent as BasePacmanAgent
+    from agent_interface import GhostAgent as BaseGhostAgent
+    from environment import Move
+except ImportError:
+    # Fallback for local testing if src is not reachable
+    class BasePacmanAgent: 
+        def __init__(self, **kwargs): pass
+    class BaseGhostAgent: 
+        def __init__(self, **kwargs): pass
+    class Move:
+        UP = ( -1, 0)
+        DOWN = ( 1, 0)
+        LEFT = ( 0, -1)
+        RIGHT = ( 0, 1)
+        STAY = ( 0, 0)
+        @property
+        def value(self): return self
+
+try:
+    # Try to import from the same directory
     from model import PacmanNet
 except ImportError:
-    # Fallback nếu không tìm thấy file model (để tránh crash lúc nộp nếu thiếu)
+    # Fallback if model.py is not found
     PacmanNet = None
 class PacmanAgent(BasePacmanAgent):
     """
@@ -519,3 +534,6 @@ class GhostAgent(BaseGhostAgent):
         moves = self.get_valid_moves_with_pos(pos, map_state)
         if moves: return random.choice(moves)[1]
         return Move.STAY
+
+
+        
