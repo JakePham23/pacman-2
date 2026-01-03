@@ -1,5 +1,5 @@
-# Kế hoạch tối ưu Project 2 - Group 8
-**Mục tiêu:** Đạt thứ hạng cao trong Tournament với cấu hình: Limited Vision, Pacman Speed 2 (Có khả năng di chuyển 2 ô trong 1 lượt nếu là đường thẳng và không có vật cản), Capture Distance 2 (Có thể bắt Ghost khi khoảng cách là 2 ô).
+# Group 8
+**Mục tiêu:** Đạt thứ hạng cao trong Tournament với cấu hình: Limited Vision (Tầm nhìn 5 ô - theo mục 1.1), Pacman Speed 2, Capture Distance 1 (Bắt được Ghost khi ở cùng một vị trí).
 
 ---
 
@@ -16,9 +16,9 @@
 ---
 
 ## 🏹 2. Pacman Specialist (Pursuit & Interception)
-- [ ] **Chiến thuật Capture Dist 2:** 
-    - Sửa mục tiêu của thuật toán A*: Đích đến của Pacman là bất kỳ ô nào lân cận (Up, Down, Left, Right) của Ghost. 
-    - *Chú ý:* Không cần cố gắng dẫm lên cùng ô với Ghost, chỉ cần đứng sát cạnh là thắng.
+- [ ] **Chiến thuật Capture Dist 1:** 
+    - Đích đến của Pacman là chính xác vị trí của Ghost (`target = enemy_position`).
+    - *Chú ý:* Phải dẫm lên cùng một ô với Ghost mới được tính là bắt thành công.
 - [ ] **Dự đoán đón đầu (Interception):** 
     - Tính toán vector vận tốc Ghost: `velocity = (curr_pos[0] - last_pos[0], curr_pos[1] - last_pos[1])`.
     - Pacman sẽ A* tới vị trí dự đoán: `predict_pos = current_ghost_pos + velocity`.
@@ -31,8 +31,8 @@
 - [ ] **Alpha-Beta Pruning (Bắt buộc):** 
     - Thêm tham số `alpha`, `beta` vào hàm `minimax`. 
     - Giúp Ghost có thể nhìn sâu tới 6-8 bước (depth) thay vì 4 bước như hiện tại trong cùng một khoảng thời gian 0.9s.
-- [ ] **Cập nhật Win Condition (Dist < 2):** 
-    - Trong Minimax, nếu khoảng cách Manhattan giữa Ghost và Pacman `<= 1`, trả về điểm phạt cực nặng (Coi như đã bị bắt).
+- [ ] **Cập nhật Win Condition (Dist == 0):** 
+    - Trong Minimax, nếu khoảng cách Manhattan giữa Ghost và Pacman == 0, trả về điểm phạt cực nặng (Bị bắt).
 - [ ] **Tránh Ngõ Cụt (Dead-end Avoidance):** 
     - Thêm hàm `is_dead_end(pos)`: Kiểm tra xem ô đó có phải đường cụt không.
     - Trong hàm Evaluate, trừ điểm nặng nếu Ghost di chuyển vào các hành lang cụt chỉ có 1 lối thoát.
@@ -49,5 +49,9 @@
     - Sử dụng `time.time()` để ngắt hàm `step` ở mốc 0.85s. Luôn có một nước đi dự phòng (fallback move) nhanh chóng (ví dụ: A* đơn giản hoặc đi thẳng) nếu Minimax quá tải.
 
 ## 🛠 Lưu ý chung
-- Lệnh chạy kiểm thử chuẩn: `python3 src/arena.py --capture-dist=2 --pacman-speed=2 --seek 8 --hide 8`
-- Tất cả các file bổ sung (model, script) phải nằm trong thư mục của team để không bị lỗi khi nộp bài.
+- **Định nghĩa Capture Distance 1:** Pacman thắng khi dẫm lên cùng vị trí với Ghost (Manhattan distance = 0).
+- **Lệnh chạy kiểm thử chuẩn:**
+  ```bash
+  python3 arena.py --seek 8 --hide 8 --capture-distance 1 --pacman-speed 2 --pacman-obs-radius 5 --ghost-obs-radius 5
+  ```
+- Tất cả các file bổ sung (model, script) phải nằm trong thư mục của team (`submissions/8/`) để không bị lỗi khi nộp bài.
