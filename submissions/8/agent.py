@@ -81,6 +81,7 @@ class PacmanAgent(BasePacmanAgent):
         self.last_move = None
         self.internal_map = None # Will store 0 for empty, 1 for wall, -1 for unknown
         self.map_initialized = False
+        self.last_seen_map = None #Lưu step cuối cùng nhìn thấy ô đó
         # --- LOAD MODEL ML ---
         self.device = torch.device("cpu") # Nộp bài bắt buộc dùng CPU
         self.model = None
@@ -106,16 +107,64 @@ class PacmanAgent(BasePacmanAgent):
                 print(f"Model load error: {e}")
                 self.model = None
 
-    def _update_map_memory(self, map_state):
+    def _update_map_memory(self, map_state, step_number):
         if not self.map_initialized:
             self.internal_map = np.full_like(map_state, -1)
             self.map_initialized = True
-        visible_mask = map_state != -1
-        self.internal_map[visible_mask] = map_state[visible_mask]
+            self.last_seen_map = np.full_like(map_state, -1) # Khởi tạo bảng thời gian
         
         # Update visible cells: where map_state is not -1 (unseen)
         visible_mask = map_state != -1
         self.internal_map[visible_mask] = map_state[visible_mask]
+
+        # Ghi số bước (step_number) hiện tại vào những ô đang nhìn thấy
+        self.last_seen_map[visible_mask] = step_number
+
+    def find_frontier(self, my_pos):
+        """
+        Tìm Frontier (Đường biên giới):
+        Là các ô đã biết là ĐƯỜNG ĐI (0) nhưng nằm cạnh vùng CHƯA BIẾT (-1).
+        Mục tiêu: Đi đến đây để mở rộng tầm nhìn an toàn.
+        """
+        # Nếu chưa có bản đồ thì chịu, không tìm được
+        if self.internal_map is None: 
+            return None
+        
+        rows, cols = self.internal_map.shape
+        
+        # 1. Lọc ra tất cả các ô đang là ĐƯỜNG ĐI (0) trong bộ nhớ
+        empty_cells = np.argwhere(self.internal_map == 0) #danh sách toạ độ tất cả các ô đường đi (0) mà Pacman đã biết.
+        
+        frontiers = []
+
+        # 2. Duyệt qua từng ô đường đi để xem nó có phải là "Biên giới" không
+        for r, c in empty_cells:
+            is_frontier = False
+            # Kiểm tra 4 ô xung quanh (Lên, Xuống, Trái, Phải)
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                
+                # Nếu hàng xóm nằm trong phạm vi bản đồ
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    # VÀ hàng xóm là SƯƠNG MÙ (-1)
+                    if self.internal_map[nr, nc] == -1:
+                        is_frontier = True
+                        break # Chỉ cần 1 hướng có sương mù là đủ điều kiện
+            
+            if is_frontier:
+                frontiers.append((r, c))
+        
+        # Nếu không tìm thấy biên giới nào (tức là map đã sáng hết 100%)
+        if not frontiers:
+            return None
+
+        # 3. Sắp xếp các điểm biên giới theo khoảng cách gần Pacman nhất
+        # Để Pacman ưu tiên khám phá vùng gần trước, đỡ chạy lòng vòng
+        frontiers.sort(key=lambda pos: self._manhattan_distance(my_pos, tuple(pos)))
+        
+        # Trả về tọa độ của biên giới gần nhất (dạng tuple)
+        return tuple(frontiers[0])
+        
     def get_ml_action(self, map_data, my_pos, enemy_pos):
         """Chạy Model để lấy nước đi tốt nhất"""
         try:
@@ -169,7 +218,7 @@ class PacmanAgent(BasePacmanAgent):
             return Move.STAY
     def step(self, map_state: np.ndarray, my_position: tuple, enemy_position: tuple, step_number: int):
         self.step_count = step_number
-        self._update_map_memory(map_state)
+        self._update_map_memory(map_state,step_number)
         
         if enemy_position:
             self.last_known_enemy_pos = enemy_position
@@ -189,32 +238,42 @@ class PacmanAgent(BasePacmanAgent):
             
         # 2. Nếu không thấy địch hoặc ML fail -> Dùng A* để đi tuần tra/khám phá
         if not use_ml or chosen_move == Move.STAY:
-            path = []
-            if target:
-                path = self.astar(my_position, target, self.internal_map)
-            else:
-                # Explore Mode: Tìm sương mù gần nhất
-                unknowns = np.argwhere(self.internal_map == -1)
-                if len(unknowns) > 0:
-                    dists = np.sum(np.abs(unknowns - np.array(my_position)), axis=1)
-                    nearest_unknown = tuple(unknowns[np.argmin(dists)])
-                    path = self.astar(my_position, nearest_unknown, self.internal_map)
-                else:
-                    # Map sáng hết mà ko thấy địch -> đi về giữa hoặc random
-                    path = self.astar(my_position, (10, 10), self.internal_map)
+            # Dùng hàm find_frontier thay vì tìm sương mù random
+            frontier = self.find_frontier(my_position)
             
-            if path:
-                chosen_move = path[0]
+            if frontier:
+                # Nếu tìm thấy biên giới -> Đi đến đó để mở map
+                path = self.astar(my_position, frontier, self.internal_map)
+                if path: chosen_move = path[0]
             else:
-                # Fallback Random
-                valid_moves = [m for m in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT] 
-                               if self._can_move_steps(my_position, m, self.internal_map, 1)]
-                if valid_moves:
-                     # Ưu tiên đi thẳng
-                    if self.last_move in valid_moves:
-                        chosen_move = self.last_move
-                    else:
-                        chosen_move = valid_moves[0]
+                # CHIẾN THUẬT TUẦN TRA (PATROL)
+                # Map sáng hết mà ko thấy địch -> Đi đến nơi "cũ nhất" (step bé nhất trong last_seen_map)
+                
+                walkable_mask = (self.internal_map == 0)
+                if np.any(walkable_mask):
+                    # Tìm timestamp nhỏ nhất
+                    min_step = np.min(self.last_seen_map[walkable_mask])
+                    # Lấy danh sách các ô có timestamp đó
+                    oldest_places = np.argwhere((self.last_seen_map == min_step) & walkable_mask)
+                    
+                    if len(oldest_places) > 0:
+                        # Chọn ngẫu nhiên 1 điểm cũ nhất
+                        import random
+                        idx = random.randint(0, len(oldest_places) - 1)
+                        patrol_target = tuple(oldest_places[idx])
+                        path = self.astar(my_position, patrol_target, self.internal_map)
+                        if path: chosen_move = path[0]
+                
+                # Fallback Random (Phòng khi kẹt)
+                if chosen_move == Move.STAY:
+                    valid_moves = [m for m in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT] 
+                                   if self._can_move_steps(my_position, m, self.internal_map, 1)]
+                    if valid_moves:
+                        if self.last_move in valid_moves:
+                            chosen_move = self.last_move
+                        else:
+                            import random
+                            chosen_move = random.choice(valid_moves)
 
         # --- MOMENTUM LOGIC (SPEED 2) ---
         steps = 1
