@@ -1,5 +1,5 @@
 # Kế hoạch tối ưu Project 2 - Group 8
-**Mục tiêu:** Đạt thứ hạng cao trong Tournament với cấu hình: Limited Vision, Pacman Speed 2, Capture Distance 2.
+**Mục tiêu:** Đạt thứ hạng cao trong Tournament với cấu hình: Limited Vision, Pacman Speed 2 (Có khả năng di chuyển 2 ô trong 1 lượt nếu là đường thẳng và không có vật cản), Capture Distance 2 (Có thể bắt Ghost khi khoảng cách là 2 ô).
 
 ---
 
