@@ -76,8 +76,12 @@ class PacmanAgent(BasePacmanAgent):
         # --- 1. SETUP MEMORY ---
         self.internal_map = None 
         self.map_initialized = False
+        self.last_seen = None # Lưu bước cuối cùng nhìn thấy ô đó
         self.last_known_enemy_pos = None
+        self.last_enemy_velocity = (0, 0)
         self.last_move = Move.STAY
+        self.time_limit = 0.85 
+        self.steps_since_seen = 0 # Fixed: Thêm để tránh lỗi attribute
         
         # --- 2. SETUP MACHINE LEARNING (PYTORCH) ---
         self.device = torch.device("cpu") # Bắt buộc dùng CPU cho bài nộp
@@ -112,9 +116,12 @@ class PacmanAgent(BasePacmanAgent):
     def _update_map_memory(self, map_state, step_number):
         if not self.map_initialized:
             self.internal_map = np.full_like(map_state, -1)
+            self.last_seen = np.zeros_like(map_state)
             self.map_initialized = True
+        
         visible_mask = map_state != -1
         self.internal_map[visible_mask] = map_state[visible_mask]
+        self.last_seen[visible_mask] = step_number # Lưu vết thời gian (Task 1)
 
     # --- PHẦN AI (MACHINE LEARNING) ---
     def get_ml_action(self, map_data, my_pos, enemy_pos):
@@ -160,7 +167,8 @@ class PacmanAgent(BasePacmanAgent):
 
     # --- GAME LOOP CHÍNH ---
     def step(self, map_state: np.ndarray, my_position: tuple, enemy_position: tuple, step_number: int):
-        self._update_map_memory(map_state)
+        start_time = time.time()
+        self._update_map_memory(map_state, step_number) # Fixed Task 1: Thêm step_number
         
         # Xác định mục tiêu
         target = None
@@ -170,58 +178,117 @@ class PacmanAgent(BasePacmanAgent):
         else:
             target = self.last_known_enemy_pos
 
+        # Đón đầu (Interception/Aiming)
+        aim_pos = target
+        if enemy_position:
+            self.steps_since_seen = 0
+            if self.last_known_enemy_pos:
+                self.last_enemy_velocity = (enemy_position[0] - self.last_known_enemy_pos[0], 
+                                            enemy_position[1] - self.last_known_enemy_pos[1])
+            
+            d_r, d_c = self.last_enemy_velocity
+            pred_pos = (enemy_position[0] + d_r, enemy_position[1] + d_c)
+            if self._is_valid_position(pred_pos, self.internal_map):
+                aim_pos = pred_pos
+        else:
+            self.steps_since_seen += 1
+            # Nếu vừa mất dấu, vẫn dự đoán theo quán tính cũ (tối đa 3 bước)
+            if self.steps_since_seen <= 3 and self.last_known_enemy_pos:
+                d_r, d_c = self.last_enemy_velocity
+                pred_pos = (self.last_known_enemy_pos[0] + d_r * self.steps_since_seen, 
+                            self.last_known_enemy_pos[1] + d_c * self.steps_since_seen)
+                if self._is_valid_position(pred_pos, self.internal_map):
+                    aim_pos = pred_pos
+
         chosen_move = Move.STAY
         
-        # --- BƯỚC 1: THỬ DÙNG AI (MACHINE LEARNING) ---
-        if self.model and target:
-            # Dùng AI để đoán nước đi
-            chosen_move = self.get_ml_action(self.internal_map, my_position, target)
-
-        # --- BƯỚC 2: FALLBACK SANG A* (NẾU AI FAIL HOẶC MUỐN ĐỨNG IM) ---
-        # Nếu AI trả về STAY hoặc không có AI, ta dùng thuật toán A* Interception
-        if chosen_move == Move.STAY:
-            # A. Tính vị trí đón đầu (Interception)
-            aim_pos = target
-            if enemy_position and self.last_known_enemy_pos and enemy_position != self.last_known_enemy_pos:
-                 # Logic đơn giản: Nếu Ghost vừa di chuyển, dự đoán nó đi tiếp hướng đó
-                 d_r = enemy_position[0] - self.last_known_enemy_pos[0]
-                 d_c = enemy_position[1] - self.last_known_enemy_pos[1]
-                 pred_pos = (enemy_position[0] + d_r, enemy_position[1] + d_c)
-                 if self._is_valid_position(pred_pos, self.internal_map):
-                     aim_pos = pred_pos
-
-            # B. Tìm đường A*
-            path = []
-            if aim_pos:
-                path = self.astar(my_position, aim_pos, self.internal_map)
-            
-            # C. Nếu không có đường tới Ghost, đi khám phá (Explore)
-            if not path:
-                path = self.explore_strategy(my_position)
-            
+        # --- BƯỚC 1: TÌM ĐƯỜNG (A* SEARCH) - Ưu tiên hàng đầu khi thấy Ghost ---
+        if aim_pos:
+            path = self.astar(my_position, aim_pos, self.internal_map)
             if path:
                 chosen_move = path[0]
 
+        # --- BƯỚC 2: AI HOẶC KHÁM PHÁ (NẾU A* KHÔNG CÓ ĐƯỜNG) ---
+        if chosen_move == Move.STAY:
+            # Ưu tiên AI Model cho chiến thuật khám phá nếu A* tịt ngóm
+            if self.model and target:
+                chosen_move = self.get_ml_action(self.internal_map, my_position, target)
+            
+            # Nếu AI vẫn không có nước đi tốt, đi khám phá vùng mù
+            if chosen_move == Move.STAY:
+                path = self.explore_strategy(my_position)
+                if path:
+                    chosen_move = path[0]
+
         # --- BƯỚC 3: MOMENTUM (SPEED 2 CHECK) ---
-        # Kiểm tra xem có thể phóng 2 bước với nước đi đã chọn không
         steps_to_take = 1
         if chosen_move != Move.STAY and self.pacman_speed >= 2:
-            # Nếu AI chọn đi lên, và ô tiếp theo nữa cũng trống -> Đi 2 bước
-            if self._can_move_steps(my_position, chosen_move, self.internal_map, 2):
+            dr, dc = chosen_move.value
+            step1_pos = (my_position[0] + dr, my_position[1] + dc)
+            step2_pos = (my_position[0] + dr * 2, my_position[1] + dc * 2)
+
+            # Chiến thuật: Luôn cố gắng dẫm lên Ghost.
+            # Nếu Ghost ở cách 1 ô (step1_pos == target), nhưng ta dự đoán nó sẽ chạy tới ô thứ 2 (step2_pos == aim_pos),
+            # thì ta phải nhảy 2 bước mới bắt được.
+            if aim_pos == step2_pos and self._can_move_steps(my_position, chosen_move, self.internal_map, 2):
                 steps_to_take = 2
+            # Nếu Ghost ở xa, cứ phóng nhanh nhất có thể
+            elif self._can_move_steps(my_position, chosen_move, self.internal_map, 2):
+                # Ngoại trừ trường hợp: Ghost đứng im ở ngay bước 1 và ta đã ở ngay đó
+                if step1_pos == target and aim_pos == target:
+                    steps_to_take = 1
+                else:
+                    steps_to_take = 2
+            else:
+                steps_to_take = 1
                 
         self.last_move = chosen_move
+        
+        # Task 4: Timeout Guard check
+        if time.time() - start_time > self.time_limit:
+            print(f"⚠️ Pacman Timeout Guard triggered! ({time.time()-start_time:.3f}s)")
+            
         return chosen_move, steps_to_take
 
     # --- CÁC HÀM THUẬT TOÁN (A*, HELPER) ---
+    def find_frontier(self, map_state):
+        """Tìm các ô trống (0) có ít nhất một hướng hàng xóm là sương mù (-1)."""
+        frontiers = []
+        rows, cols = map_state.shape
+        for r in range(rows):
+            for c in range(cols):
+                if map_state[r, c] == 0:
+                    # Check neighbors
+                    for dr, dc in [(0,1), (0,-1), (1,0), (-1,0)]:
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < rows and 0 <= nc < cols:
+                            if map_state[nr, nc] == -1:
+                                frontiers.append((r, c))
+                                break
+        return frontiers
+
     def explore_strategy(self, my_pos):
-        unknowns = np.argwhere(self.internal_map == -1)
-        if len(unknowns) > 0:
-            dists = np.sum(np.abs(unknowns - np.array(my_pos)), axis=1)
-            nearest_unknown = tuple(unknowns[np.argmin(dists)])
-            return self.astar(my_pos, nearest_unknown, self.internal_map)
+        # 1. Tìm Frontier (Task 1)
+        frontiers = self.find_frontier(self.internal_map)
+        if frontiers:
+            # Sắp xếp theo: Khoảng cách + (Vùng lâu chưa quét)
+            # (Logic đơn giản: Ưu tiên Frontier gần nhất)
+            dists = [abs(f[0]-my_pos[0]) + abs(f[1]-my_pos[1]) for f in frontiers]
+            target = frontiers[np.argmin(dists)]
+            return self.astar(my_pos, target, self.internal_map)
         
-        # Fallback Random nếu map sáng hết
+        # 2. Nếu hết Frontier, tìm vùng quá lâu chưa quét (Timestamping Task 1)
+        if self.last_seen is not None:
+            # Tìm các ô không phải tường mà có last_seen thấp nhất
+            walkable = (self.internal_map == 0)
+            if np.any(walkable):
+                min_step = np.min(self.last_seen[walkable])
+                old_areas = np.argwhere((self.last_seen == min_step) & walkable)
+                if len(old_areas) > 0:
+                    target = tuple(old_areas[0])
+                    return self.astar(my_pos, target, self.internal_map)
+        
+        # Fallback Random nếu bí đường
         valid_moves = [m for m in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT] 
                        if self._can_move_steps(my_pos, m, self.internal_map, 1)]
         if valid_moves: return [random.choice(valid_moves)]
@@ -235,7 +302,7 @@ class PacmanAgent(BasePacmanAgent):
         while frontier:
             _, _, current, path = heappop(frontier)
             if current == goal: return path
-            if len(path) > 40: continue # Cắt ngắn nếu quá xa
+            if len(path) > 150: continue # Mở rộng tầm tìm kiếm cho map lớn
             
             for next_pos, move in self._get_neighbors(current, map_state):
                 if next_pos not in visited:
@@ -290,7 +357,7 @@ class GhostAgent(BaseGhostAgent):
     def step(self, map_state: np.ndarray, my_position: tuple, enemy_position: tuple, step_number: int) -> Move:
         self.time_start = time.time()
         
-        # 1. Cập nhật thông tin kẻ địch
+        # 1. Update enemy info
         if enemy_position:
             self.last_known_enemy_pos = enemy_position
             self.steps_since_seen = 0
@@ -300,24 +367,24 @@ class GhostAgent(BaseGhostAgent):
 
         target_enemy = enemy_position or self.last_known_enemy_pos
 
-        # --- CHIẾN THUẬT A: ĐI TUẦN (Mất dấu > 7 bước hoặc chưa từng thấy) ---
+        # Fallback move in case minimax fails or times out immediately
+        best_move = self.get_random_valid_move(my_position, map_state)
+
+        # --- STRATEGY A: PATROL ---
         if target_enemy is None or self.steps_since_seen > 7:
             if not self.survival_target or my_position == self.survival_target:
                  self.survival_target = self.find_nearest_intersection(my_position, map_state)
             
             path = self.bfs_find_path(my_position, self.survival_target, map_state)
-            if path: return path[0]
-            return self.get_random_valid_move(my_position, map_state)
+            return path[0] if path else best_move
 
-        # --- CHIẾN THUẬT B: ALPHA-BETA MINIMAX ---
+        # --- STRATEGY B: ALPHA-BETA MINIMAX ---
         else:
-            best_move = Move.STAY
-            # Iterative Deepening: Tăng dần độ sâu tìm kiếm
-            for depth in range(1, 20): 
+            for depth in range(1, 10): # Depth 20 is likely too deep for 0.85s
                 try:
                     if time.time() - self.time_start > self.time_limit: break
                     
-                    _, move = self.minimax(
+                    score, move = self.minimax(
                         my_pos=my_position, 
                         enemy_pos=target_enemy, 
                         depth=depth, 
@@ -327,14 +394,14 @@ class GhostAgent(BaseGhostAgent):
                         map_state=map_state
                     )
                     
-                    if time.time() - self.time_start < self.time_limit:
+                    # ONLY update if we got a valid move and haven't timed out
+                    if move is not None and isinstance(move, Move):
                         best_move = move
-                    else:
-                        break 
                 except TimeoutError:
                     break
             
-            return best_move
+            # Final sanity check: if best_move is somehow still None, return STAY
+            return best_move if best_move is not None else Move.STAY
 
     # =========================================================================
     # MINIMAX (SỬA ĐỔI CHO CAPTURE DISTANCE 1)
@@ -346,7 +413,7 @@ class GhostAgent(BaseGhostAgent):
         # 1. Kiểm tra điều kiện thua ngay lập tức (Capture Distance Logic)
         curr_dist = abs(my_pos[0] - enemy_pos[0]) + abs(my_pos[1] - enemy_pos[1])
         if curr_dist <= self.capture_dist:
-            return -100000, None # Bị bắt (kể cả đứng cạnh cũng chết)
+            return -100000, Move.STAY # Sửa None thành Move.STAY để tránh lỗi Type Error
 
         # 2. Hết độ sâu tìm kiếm
         if depth == 0:
@@ -391,7 +458,7 @@ class GhostAgent(BaseGhostAgent):
             for p_pos in pacman_reachable:
                 dist_check = abs(my_pos[0] - p_pos[0]) + abs(my_pos[1] - p_pos[1])
                 if dist_check <= self.capture_dist:
-                    return -100000, None # Pacman bắt được Ghost
+                    return -100000, Move.STAY # Pacman bắt được Ghost
 
             for next_enemy_pos in pacman_reachable:
                 eval_score, _ = self.minimax(my_pos, next_enemy_pos, depth - 1, alpha, beta, True, map_state)
