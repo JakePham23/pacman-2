@@ -62,321 +62,211 @@ except ImportError:
     PacmanNet = None
 class PacmanAgent(BasePacmanAgent):
     """
-    Pacman (Seeker) Agent - Goal: Catch the Ghost
-    
-    Implement your search algorithm to find and catch the ghost.
-    Suggested algorithms: BFS, DFS, A*, Greedy Best-First
+    Pacman Hybrid Agent:
+    - Deep Learning (DQN) để ra quyết định chiến lược.
+    - A* Interception (Đón đầu) làm phương án dự phòng (Fallback).
+    - Hỗ trợ Speed 2 Momentum.
     """
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.pacman_speed = max(1, int(kwargs.get("pacman_speed", 1)))
-        # TODO: Initialize any data structures you need
-        # Examples:
-        # - self.path = []  # Store planned path
-        # - self.visited = set()  # Track visited positions
-        self.name = "Template Pacman"
-        # Memory for limited observation mode
-        self.last_known_enemy_pos = None
-        self.last_move = None
-        self.internal_map = None # Will store 0 for empty, 1 for wall, -1 for unknown
+        self.name = "Pacman AI + A*"
+        
+        # --- 1. SETUP MEMORY ---
+        self.internal_map = None 
         self.map_initialized = False
-        self.last_seen_map = None #Lưu step cuối cùng nhìn thấy ô đó
-        # --- LOAD MODEL ML ---
-        self.device = torch.device("cpu") # Nộp bài bắt buộc dùng CPU
+        self.last_known_enemy_pos = None
+        self.last_move = Move.STAY
+        
+        # --- 2. SETUP MACHINE LEARNING (PYTORCH) ---
+        self.device = torch.device("cpu") # Bắt buộc dùng CPU cho bài nộp
         self.model = None
-        if PacmanNet:
-            try:
+        
+        # Thử load model nếu class PacmanNet tồn tại (bạn cần đảm bảo đã import class này)
+        # Nếu chưa import PacmanNet thì đoạn này sẽ bị try/except bỏ qua
+        try:
+            # from your_model_file import PacmanNet # <-- Bỏ comment nếu cần import
+            if 'PacmanNet' in globals():
                 self.model = PacmanNet()
-                # Tự động tìm file .pt trong cùng thư mục
+                
+                # Tìm file weights
                 current_dir = Path(__file__).parent
-                # Ưu tiên file smart ghost, nếu không có thì tìm file dqn thường
-                model_path = current_dir / "pacman_smart_ghost.pt"
+                model_path = current_dir / "pacman_smart_ghost.pt" # Ưu tiên
                 if not model_path.exists():
-                    model_path = current_dir / "pacman_dqn.pt"
+                    model_path = current_dir / "pacman_dqn.pt"     # Dự phòng
                 
                 if model_path.exists():
-                    # Load weights (map_location='cpu' để an toàn)
                     self.model.load_state_dict(torch.load(model_path, map_location=self.device))
                     self.model.eval()
-                    # print(f"Model loaded: {model_path.name}")
+                    print(f"✅ Đã load AI Model: {model_path.name}")
                 else:
-                    print("Warning: No .pt file found! Pacman will use A* only.")
+                    print("⚠️ Không tìm thấy file .pt! Sẽ chạy bằng A* thuần.")
                     self.model = None
-            except Exception as e:
-                print(f"Model load error: {e}")
-                self.model = None
+            else:
+                print("⚠️ Class PacmanNet chưa được định nghĩa/import. Chạy A*.")
+        except Exception as e:
+            print(f"❌ Lỗi load Model: {e}")
+            self.model = None
 
     def _update_map_memory(self, map_state, step_number):
         if not self.map_initialized:
             self.internal_map = np.full_like(map_state, -1)
             self.map_initialized = True
-            self.last_seen_map = np.full_like(map_state, -1) # Khởi tạo bảng thời gian
-        
-        # Update visible cells: where map_state is not -1 (unseen)
         visible_mask = map_state != -1
         self.internal_map[visible_mask] = map_state[visible_mask]
 
-        # Ghi số bước (step_number) hiện tại vào những ô đang nhìn thấy
-        self.last_seen_map[visible_mask] = step_number
-
-    def find_frontier(self, my_pos):
-        """
-        Tìm Frontier (Đường biên giới):
-        Là các ô đã biết là ĐƯỜNG ĐI (0) nhưng nằm cạnh vùng CHƯA BIẾT (-1).
-        Mục tiêu: Đi đến đây để mở rộng tầm nhìn an toàn.
-        """
-        # Nếu chưa có bản đồ thì chịu, không tìm được
-        if self.internal_map is None: 
-            return None
-        
-        rows, cols = self.internal_map.shape
-        
-        # 1. Lọc ra tất cả các ô đang là ĐƯỜNG ĐI (0) trong bộ nhớ
-        empty_cells = np.argwhere(self.internal_map == 0) #danh sách toạ độ tất cả các ô đường đi (0) mà Pacman đã biết.
-        
-        frontiers = []
-
-        # 2. Duyệt qua từng ô đường đi để xem nó có phải là "Biên giới" không
-        for r, c in empty_cells:
-            is_frontier = False
-            # Kiểm tra 4 ô xung quanh (Lên, Xuống, Trái, Phải)
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nr, nc = r + dr, c + dc
-                
-                # Nếu hàng xóm nằm trong phạm vi bản đồ
-                if 0 <= nr < rows and 0 <= nc < cols:
-                    # VÀ hàng xóm là SƯƠNG MÙ (-1)
-                    if self.internal_map[nr, nc] == -1:
-                        is_frontier = True
-                        break # Chỉ cần 1 hướng có sương mù là đủ điều kiện
-            
-            if is_frontier:
-                frontiers.append((r, c))
-        
-        # Nếu không tìm thấy biên giới nào (tức là map đã sáng hết 100%)
-        if not frontiers:
-            return None
-
-        # 3. Sắp xếp các điểm biên giới theo khoảng cách gần Pacman nhất
-        # Để Pacman ưu tiên khám phá vùng gần trước, đỡ chạy lòng vòng
-        frontiers.sort(key=lambda pos: self._manhattan_distance(my_pos, tuple(pos)))
-        
-        # Trả về tọa độ của biên giới gần nhất (dạng tuple)
-        return tuple(frontiers[0])
-        
+    # --- PHẦN AI (MACHINE LEARNING) ---
     def get_ml_action(self, map_data, my_pos, enemy_pos):
-        """Chạy Model để lấy nước đi tốt nhất"""
+        if self.model is None: return Move.STAY
         try:
-            # 1. Preprocess Map (Giống lúc train)
-            # Map lúc train là 0=Empty, 1=Wall, 2=Pacman, 3=Ghost. Không có -1.
-            # Nên ta thay -1 (unseen) thành 0 (coi như đi được) hoặc 1 (tường) để model không bị loạn.
-            # An toàn nhất: Coi unseen là tường để tránh đâm bậy, hoặc empty để dũng cảm.
-            # Chọn: Replace -1 -> 0 (Optimistic)
+            # 1. Tiền xử lý Map: Thay -1 (mù) bằng 0 (trống) hoặc 1 (tường) tùy cách bạn train
             input_map = map_data.copy()
             input_map[input_map == -1] = 0 
             
-            # Đánh dấu vị trí
+            # Đánh dấu vị trí trên map (nếu model của bạn cần feature này)
+            # Lưu ý: Logic này phụ thuộc vào cách bạn design mạng DQN
             if my_pos: input_map[my_pos] = 2
             if enemy_pos: input_map[enemy_pos] = 3
             
-            # 2. Tensor conversion
+            # 2. Chuyển sang Tensor
             state_tensor = torch.FloatTensor(input_map).unsqueeze(0).unsqueeze(0).to(self.device)
             
-            # 3. Last move vector
+            # 3. Vector nước đi trước (Last move)
             move_idx = -1
             all_moves = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]
             if self.last_move in all_moves:
                 move_idx = all_moves.index(self.last_move)
             
             last_move_vec = torch.zeros(1, 4).to(self.device)
-            if move_idx >= 0:
-                last_move_vec[0, move_idx] = 1.0
+            if move_idx >= 0: last_move_vec[0, move_idx] = 1.0
                 
-            # 4. Predict
+            # 4. AI Suy nghĩ
             with torch.no_grad():
+                # Giả định hàm forward nhận (map, last_move)
                 q_values = self.model(state_tensor, last_move_vec)
                 action_idx = torch.argmax(q_values).item()
-                
+            
             predicted_move = all_moves[action_idx]
             
-            reverse_map = {Move.UP: Move.DOWN, Move.DOWN: Move.UP, 
-                           Move.LEFT: Move.RIGHT, Move.RIGHT: Move.LEFT}
-            
-            # Nếu nước đi mới là quay ngược lại hướng cũ -> Bỏ qua, để cho A* xử lý
-            if predicted_move == reverse_map.get(self.last_move, None):
-                return Move.STAY # Trả về STAY để kích hoạt fallback A* (A* khôn hơn trong việc gỡ rối)
-            # --------------------------------------------------
-
-            # 5. Safety Check
+            # 5. Kiểm tra an toàn cơ bản (Safety Check)
             if self._can_move_steps(my_pos, predicted_move, map_data, 1):
                 return predicted_move
-            else:
-                return Move.STAY
-                
-        except Exception:
             return Move.STAY
+            
+        except Exception as e:
+            # print(f"ML Error: {e}")
+            return Move.STAY
+
+    # --- GAME LOOP CHÍNH ---
     def step(self, map_state: np.ndarray, my_position: tuple, enemy_position: tuple, step_number: int):
-        self.step_count = step_number
-        self._update_map_memory(map_state,step_number)
+        self._update_map_memory(map_state)
         
+        # Xác định mục tiêu
+        target = None
         if enemy_position:
             self.last_known_enemy_pos = enemy_position
-        
-        target = enemy_position or self.last_known_enemy_pos
-        
+            target = enemy_position
+        else:
+            target = self.last_known_enemy_pos
+
         chosen_move = Move.STAY
-        use_ml = False
-
-        # --- CHIẾN THUẬT QUYẾT ĐỊNH ---
-        # 1. Nếu thấy địch (hoặc biết vị trí gần đây) -> Dùng ML để săn (Aggressive)
-        if target and self.model is not None:
-            # Chỉ dùng ML nếu địch đang hiển thị trên bản đồ (để input chính xác)
-            # Hoặc nếu ta giả lập vị trí địch vào bản đồ memory
-            chosen_move = self.get_ml_action(self.internal_map, my_position, target)
-            use_ml = True
-            
-        # 2. Nếu không thấy địch hoặc ML fail -> Dùng A* để đi tuần tra/khám phá
-        if not use_ml or chosen_move == Move.STAY:
-            # Dùng hàm find_frontier thay vì tìm sương mù random
-            frontier = self.find_frontier(my_position)
-            
-            if frontier:
-                # Nếu tìm thấy biên giới -> Đi đến đó để mở map
-                path = self.astar(my_position, frontier, self.internal_map)
-                if path: chosen_move = path[0]
-            else:
-                # CHIẾN THUẬT TUẦN TRA (PATROL)
-                # Map sáng hết mà ko thấy địch -> Đi đến nơi "cũ nhất" (step bé nhất trong last_seen_map)
-                
-                walkable_mask = (self.internal_map == 0)
-                if np.any(walkable_mask):
-                    # Tìm timestamp nhỏ nhất
-                    min_step = np.min(self.last_seen_map[walkable_mask])
-                    # Lấy danh sách các ô có timestamp đó
-                    oldest_places = np.argwhere((self.last_seen_map == min_step) & walkable_mask)
-                    
-                    if len(oldest_places) > 0:
-                        # Chọn ngẫu nhiên 1 điểm cũ nhất
-                        import random
-                        idx = random.randint(0, len(oldest_places) - 1)
-                        patrol_target = tuple(oldest_places[idx])
-                        path = self.astar(my_position, patrol_target, self.internal_map)
-                        if path: chosen_move = path[0]
-                
-                # Fallback Random (Phòng khi kẹt)
-                if chosen_move == Move.STAY:
-                    valid_moves = [m for m in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT] 
-                                   if self._can_move_steps(my_position, m, self.internal_map, 1)]
-                    if valid_moves:
-                        if self.last_move in valid_moves:
-                            chosen_move = self.last_move
-                        else:
-                            import random
-                            chosen_move = random.choice(valid_moves)
-
-        # --- MOMENTUM LOGIC (SPEED 2) ---
-        steps = 1
-        if chosen_move != Move.STAY:
-            if (chosen_move == self.last_move and self.pacman_speed >= 2):
-                if self._can_move_steps(my_position, chosen_move, self.internal_map, 2):
-                    steps = 2
-                else:
-                    steps = 1
-            else:
-                steps = 1
         
+        # --- BƯỚC 1: THỬ DÙNG AI (MACHINE LEARNING) ---
+        if self.model and target:
+            # Dùng AI để đoán nước đi
+            chosen_move = self.get_ml_action(self.internal_map, my_position, target)
+
+        # --- BƯỚC 2: FALLBACK SANG A* (NẾU AI FAIL HOẶC MUỐN ĐỨNG IM) ---
+        # Nếu AI trả về STAY hoặc không có AI, ta dùng thuật toán A* Interception
+        if chosen_move == Move.STAY:
+            # A. Tính vị trí đón đầu (Interception)
+            aim_pos = target
+            if enemy_position and self.last_known_enemy_pos and enemy_position != self.last_known_enemy_pos:
+                 # Logic đơn giản: Nếu Ghost vừa di chuyển, dự đoán nó đi tiếp hướng đó
+                 d_r = enemy_position[0] - self.last_known_enemy_pos[0]
+                 d_c = enemy_position[1] - self.last_known_enemy_pos[1]
+                 pred_pos = (enemy_position[0] + d_r, enemy_position[1] + d_c)
+                 if self._is_valid_position(pred_pos, self.internal_map):
+                     aim_pos = pred_pos
+
+            # B. Tìm đường A*
+            path = []
+            if aim_pos:
+                path = self.astar(my_position, aim_pos, self.internal_map)
+            
+            # C. Nếu không có đường tới Ghost, đi khám phá (Explore)
+            if not path:
+                path = self.explore_strategy(my_position)
+            
+            if path:
+                chosen_move = path[0]
+
+        # --- BƯỚC 3: MOMENTUM (SPEED 2 CHECK) ---
+        # Kiểm tra xem có thể phóng 2 bước với nước đi đã chọn không
+        steps_to_take = 1
+        if chosen_move != Move.STAY and self.pacman_speed >= 2:
+            # Nếu AI chọn đi lên, và ô tiếp theo nữa cũng trống -> Đi 2 bước
+            if self._can_move_steps(my_position, chosen_move, self.internal_map, 2):
+                steps_to_take = 2
+                
         self.last_move = chosen_move
-        return (chosen_move, steps)
-    
-    # Helper methods (you can add more)
+        return chosen_move, steps_to_take
+
+    # --- CÁC HÀM THUẬT TOÁN (A*, HELPER) ---
+    def explore_strategy(self, my_pos):
+        unknowns = np.argwhere(self.internal_map == -1)
+        if len(unknowns) > 0:
+            dists = np.sum(np.abs(unknowns - np.array(my_pos)), axis=1)
+            nearest_unknown = tuple(unknowns[np.argmin(dists)])
+            return self.astar(my_pos, nearest_unknown, self.internal_map)
+        
+        # Fallback Random nếu map sáng hết
+        valid_moves = [m for m in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT] 
+                       if self._can_move_steps(my_pos, m, self.internal_map, 1)]
+        if valid_moves: return [random.choice(valid_moves)]
+        return []
+
+    def astar(self, start, goal, map_state):
+        if start == goal: return []
+        frontier = []
+        heappush(frontier, (0, 0, start, []))
+        visited = {start}
+        while frontier:
+            _, _, current, path = heappop(frontier)
+            if current == goal: return path
+            if len(path) > 40: continue # Cắt ngắn nếu quá xa
+            
+            for next_pos, move in self._get_neighbors(current, map_state):
+                if next_pos not in visited:
+                    visited.add(next_pos)
+                    # Heuristic Manhattan
+                    priority = len(path) + 1 + abs(next_pos[0]-goal[0]) + abs(next_pos[1]-goal[1])
+                    heappush(frontier, (priority, len(path)+1, next_pos, path + [move]))
+        return []
+
+    def _get_neighbors(self, pos, map_state):
+        neighbors = []
+        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            dr, dc = move.value
+            nr, nc = pos[0] + dr, pos[1] + dc
+            if 0 <= nr < map_state.shape[0] and 0 <= nc < map_state.shape[1]:
+                if map_state[nr, nc] != 1: 
+                    neighbors.append(((nr, nc), move))
+        return neighbors
+
     def _can_move_steps(self, pos, move, map_data, steps_to_check):
         r, c = pos
         dr, dc = move.value
         for i in range(1, steps_to_check + 1):
             nr, nc = r + dr * i, c + dc * i
-            if not (0 <= nr < map_data.shape[0] and 0 <= nc < map_data.shape[1]):
-                return False
-            if map_data[nr, nc] == 1: 
-                return False
+            if not (0 <= nr < map_data.shape[0] and 0 <= nc < map_data.shape[1]): return False
+            if map_data[nr, nc] == 1: return False
         return True
-    def _is_valid_move(self, pos, move, map_data):
-        return self._can_move_steps(pos, move, map_data, 1)
-    def _manhattan_distance(self, pos1, pos2):
-        return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
-    def _choose_action(self, pos: tuple, moves, map_state: np.ndarray, desired_steps: int):
-        for move in moves:
-            max_steps = min(self.pacman_speed, max(1, desired_steps))
-            steps = self._max_valid_steps(pos, move, map_state, max_steps)
-            if steps > 0:
-                return (move, steps)
-        return None
 
-    def _max_valid_steps(self, pos: tuple, move: Move, map_state: np.ndarray, max_steps: int) -> int:
-        steps = 0
-        current = pos
-        for _ in range(max_steps):
-            delta_row, delta_col = move.value
-            next_pos = (current[0] + delta_row, current[1] + delta_col)
-            if not self._is_valid_position(next_pos, map_state):
-                break
-            steps += 1
-            current = next_pos
-        return steps
-    
-    def _is_valid_move(self, pos: tuple, move: Move, map_state: np.ndarray) -> bool:
-        """Check if a move from pos is valid for at least one step."""
-        return self._max_valid_steps(pos, move, map_state, 1) == 1
-    
-    def _is_valid_position(self, pos: tuple, map_state: np.ndarray) -> bool:
-        row, col = pos
-        height, width = map_state.shape
-        if row < 0 or row >= height or col < 0 or col >= width:
-            return False
-        # SỬA: Đi được nếu không phải là tường (1). Nghĩa là 0 và -1 đều đi được.
-        return map_state[row, col] != 1
-    
-    def _apply_move(self, pos: tuple, move: Move) -> tuple:
-        """Apply a move to a position, return new position."""
-        delta_row, delta_col = move.value
-        return (pos[0] + delta_row, pos[1] + delta_col)
-    
-    def _get_neighbors(self, pos, map_state):
-        neighbors = []
-        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            dr, dc = move.value
-            next_pos = (pos[0] + dr, pos[1] + dc)
-            # A* đi được vào ô 0 và -1
-            if (0 <= next_pos[0] < map_state.shape[0] and 
-                0 <= next_pos[1] < map_state.shape[1] and 
-                map_state[next_pos] != 1):
-                neighbors.append((next_pos, move))
-        return neighbors
-    
-    def _manhattan_distance(self, pos1: tuple, pos2: tuple) -> int:
-        """Calculate Manhattan distance between two positions."""
-        return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
-    
-    def astar(self, start, goal, map_state):
-        if start == goal: return []
-        frontier = [(0, 0, start, [])]
-        visited = set()
-        counter = 0
-        while frontier:
-            _, _, current, path = heappop(frontier)
-            if current == goal: return path
-            if current in visited: continue
-            visited.add(current)
-            for next_pos, move in self._get_neighbors(current, map_state):
-                if next_pos not in visited:
-                    new_path = path + [move]
-                    g = len(new_path)
-                    h = self._manhattan_distance(next_pos, goal)
-                    f = g + h
-                    counter += 1
-                    heappush(frontier, (f, counter, next_pos, new_path))
-        return []
-
+    def _is_valid_position(self, pos, map_state):
+        r, c = pos
+        return (0 <= r < map_state.shape[0] and 0 <= c < map_state.shape[1] and map_state[r, c] != 1)
 
 class GhostAgent(BaseGhostAgent):
     """
